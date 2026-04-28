@@ -33,6 +33,7 @@ pub const DISPUTE_RESOLVED_TOPIC: Symbol = symbol_short!("disp_res");
 pub const WITHDRAWAL_SCHEDULED_TOPIC: Symbol = symbol_short!("wd_sch");
 pub const WITHDRAWAL_EXECUTED_TOPIC: Symbol = symbol_short!("wd_exec");
 pub const CONDITIONS_ACCEPTED_TOPIC: Symbol = symbol_short!("cond_acc");
+pub const RESTORE_VAULT_TOPIC: Symbol = symbol_short!("v_restore");
 
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
@@ -79,6 +80,7 @@ pub enum DataKey {
     WithdrawalSchedule(u64),
     DisputeStatus(u64),
     ConditionalAcceptance(u64),
+    ArchivedVault(u64),
 }
 
 /// A vesting schedule attached to a vault.
@@ -253,3 +255,8 @@ pub struct ConditionalAcceptanceEntry {
     pub conditions: String,
     pub approved_by_owner: bool,
 }
+
+/// Archived vault info for restoration - Issue #443
+#[contracttype]
+#[derive(Clone)]
+pub struct ArchivedVaultInfo(pub Vault);

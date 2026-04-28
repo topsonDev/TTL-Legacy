@@ -3037,3 +3037,71 @@ fn test_cannot_file_duplicate_dispute() {
     let result = client.try_file_dispute(&vault_id, &reason2);
     assert!(result.is_err());
 }
+
+// ---- Issue #443: Vault Archival and Restoration API ----
+
+#[test]
+fn test_restore_vault_extends_ttl() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    // restore_vault should succeed on a live vault (idempotent TTL extension)
+    client.restore_vault(&vault_id);
+
+    // Vault should still be accessible after restoration
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.owner, owner);
+    assert_eq!(vault.status, ReleaseStatus::Locked);
+}
+
+#[test]
+fn test_get_archived_vault_info_returns_none_for_live_vault() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    // No snapshot stored yet — should return None
+    let info = client.get_archived_vault_info(&vault_id);
+    assert!(info.is_none());
+}
+
+#[test]
+fn test_trigger_release_succeeds_after_restore() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &500_000i128);
+
+    // Advance time past expiry
+    env.ledger().with_mut(|l| l.timestamp += 200);
+
+    // trigger_release internally calls try_restore_archived_vault; should succeed
+    client.trigger_release(&vault_id);
+
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.status, ReleaseStatus::Released);
+    assert_eq!(vault.balance, 0i128);
+
+    let token_client = token::Client::new(&env, &token_address);
+    assert_eq!(token_client.balance(&beneficiary), 500_000i128);
+}
+
+#[test]
+fn test_restore_vault_emits_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+    client.restore_vault(&vault_id);
+
+    let events = env.events().all();
+    let restore_event = events.iter().find(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone().into_val(&env);
+        topics
+            .get(0)
+            .and_then(|v| v.try_into_val(&env).ok())
+            .map(|s: soroban_sdk::Symbol| s == types::RESTORE_VAULT_TOPIC)
+            .unwrap_or(false)
+    });
+    assert!(restore_event.is_some(), "restore_vault event not emitted");
+}
