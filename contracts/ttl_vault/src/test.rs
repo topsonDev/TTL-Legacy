@@ -3206,3 +3206,74 @@ fn test_merge_vaults_emits_activity_log() {
     let actions: Vec<String> = log.iter().map(|e| e.action).collect();
     assert!(actions.iter().any(|a| *a == String::from_str(&env, "merge_vaults_target")));
 }
+
+// ---- Task 3: acceptance_deadline tests ----
+
+#[test]
+fn test_set_acceptance_deadline_expired_reverts_to_owner() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &500_000i128);
+
+    let conditions = String::from_str(&env, "I accept");
+    client.accept_with_conditions(&vault_id, &conditions);
+
+    // Set deadline in the past
+    let past_deadline = env.ledger().timestamp() - 1;
+    client.set_acceptance_deadline(&vault_id, &past_deadline);
+
+    // Advance time past check_in_interval to expire vault
+    env.ledger().with_mut(|l| l.timestamp += 200);
+
+    client.trigger_release(&vault_id);
+
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.status, ReleaseStatus::Cancelled);
+    assert_eq!(vault.balance, 0);
+}
+
+#[test]
+fn test_set_acceptance_deadline_approved_releases_normally() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &500_000i128);
+
+    let conditions = String::from_str(&env, "I accept");
+    client.accept_with_conditions(&vault_id, &conditions);
+    client.approve_conditional_acceptance(&vault_id);
+
+    let future_deadline = env.ledger().timestamp() + 10_000;
+    client.set_acceptance_deadline(&vault_id, &future_deadline);
+
+    env.ledger().with_mut(|l| l.timestamp += 200);
+
+    client.trigger_release(&vault_id);
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.status, ReleaseStatus::Released);
+}
+
+#[test]
+fn test_set_acceptance_deadline_no_entry_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let result = client.try_set_acceptance_deadline(&vault_id, &(env.ledger().timestamp() + 1000));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_set_acceptance_deadline_released_vault_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &100_000i128);
+
+    let conditions = String::from_str(&env, "conditions");
+    client.accept_with_conditions(&vault_id, &conditions);
+
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_release(&vault_id);
+
+    let result = client.try_set_acceptance_deadline(&vault_id, &(env.ledger().timestamp() + 1000));
+    assert!(result.is_err());
+}
