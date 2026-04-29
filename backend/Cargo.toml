@@ -17,6 +17,8 @@ log = "0.4"
 env_logger = "0.11"
 thiserror = "1"
 csv = "1"
+# Push notifications (FCM via HTTP v1 API)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 [dev-dependencies]
 tokio-test = "0.4"

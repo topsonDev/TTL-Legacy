@@ -1,6 +1,105 @@
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 
+// ── Notification models ──────────────────────────────────────────────────────
+
+/// Notification type sent to a device.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationType {
+    ExpiryWarning,
+    CheckInReminder,
+    VaultReleased,
+    VaultPaused,
+}
+
+/// Delivery status of a single notification attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryStatus {
+    Pending,
+    Sent,
+    Failed,
+}
+
+/// A registered device push token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceToken {
+    pub owner: String,
+    pub token: String,
+    /// "ios" | "android" | "web"
+    pub platform: String,
+    pub registered_at: DateTime<Utc>,
+}
+
+/// Per-owner notification preferences.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationPreferences {
+    pub owner: String,
+    pub expiry_warning_enabled: bool,
+    pub check_in_reminder_enabled: bool,
+    pub vault_released_enabled: bool,
+    /// Hours before expiry to send the warning (default 24).
+    pub warning_hours_before: u64,
+}
+
+impl Default for NotificationPreferences {
+    fn default() -> Self {
+        Self {
+            owner: String::new(),
+            expiry_warning_enabled: true,
+            check_in_reminder_enabled: true,
+            vault_released_enabled: true,
+            warning_hours_before: 24,
+        }
+    }
+}
+
+/// A scheduled notification (pending delivery).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduledNotification {
+    pub id: String,
+    pub vault_id: String,
+    pub owner: String,
+    pub notification_type: NotificationType,
+    /// Unix timestamp when this should fire.
+    pub scheduled_at: DateTime<Utc>,
+    pub status: DeliveryStatus,
+}
+
+/// Delivery record written after each send attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliveryRecord {
+    pub notification_id: String,
+    pub vault_id: String,
+    pub owner: String,
+    pub notification_type: NotificationType,
+    pub status: DeliveryStatus,
+    pub sent_at: DateTime<Utc>,
+    /// FCM message ID on success, error string on failure.
+    pub provider_response: String,
+}
+
+/// Request body for `POST /notifications/register`.
+#[derive(Debug, Deserialize)]
+pub struct RegisterTokenRequest {
+    pub owner: String,
+    pub token: String,
+    pub platform: String,
+}
+
+/// Request body for `PUT /notifications/preferences`.
+#[derive(Debug, Deserialize)]
+pub struct UpdatePreferencesRequest {
+    pub owner: String,
+    pub expiry_warning_enabled: Option<bool>,
+    pub check_in_reminder_enabled: Option<bool>,
+    pub vault_released_enabled: Option<bool>,
+    pub warning_hours_before: Option<u64>,
+}
+
+// ── Existing models (unchanged) ──────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Vault {
     pub id: String,
@@ -142,4 +241,97 @@ pub struct CreateVaultFromTemplate {
     pub template_id: String,
     pub owner: String,
     pub beneficiary: String,
+}
+
+// ── Task 1: Analytics ────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VaultAnalytics {
+    pub total_vaults: u64,
+    pub active_vaults: u64,
+    pub average_ttl_seconds: f64,
+    pub release_rate: f64, // fraction of vaults that are Released
+    pub time_series: Vec<TimeSeriesPoint>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TimeSeriesPoint {
+    pub date: String, // ISO-8601 date (YYYY-MM-DD)
+    pub vaults_created: u64,
+    pub vaults_released: u64,
+}
+
+// ── Task 2: Backup & Recovery ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultBackup {
+    pub backup_id: String,
+    pub vault_id: String,
+    pub created_at: DateTime<Utc>,
+    /// AES-GCM encrypted JSON of the vault state (base64-encoded)
+    pub encrypted_payload: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RestoreRequest {
+    pub backup_id: String,
+    /// The same key used during backup (base64-encoded 32-byte key)
+    pub encryption_key: String,
+}
+
+// ── Task 3: Sharing & Collaboration ──────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SharePermission {
+    ViewOnly,
+    Edit,
+    Admin,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultShare {
+    pub share_id: String,
+    pub vault_id: String,
+    pub shared_with: String, // address or email
+    pub permission: SharePermission,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ShareRequest {
+    pub shared_with: String,
+    pub permission: SharePermission,
+}
+
+// ── Task 4: Notification Preferences ─────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationChannel {
+    Email,
+    Sms,
+    Push,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationFrequency {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationPreferences {
+    pub vault_id: String,
+    pub channels: Vec<NotificationChannel>,
+    pub frequency: NotificationFrequency,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NotificationPreferencesRequest {
+    pub channels: Vec<NotificationChannel>,
+    pub frequency: NotificationFrequency,
 }
