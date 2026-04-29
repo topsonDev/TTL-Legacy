@@ -1080,6 +1080,25 @@ impl TtlVaultContract {
             panic_with_error!(&env, ContractError::InvalidBeneficiary);
         }
 
+        // Check conditional acceptance deadline
+        let now = env.ledger().timestamp();
+        if let Some(entry) = env.storage().persistent()
+            .get::<DataKey, ConditionalAcceptanceEntry>(&DataKey::ConditionalAcceptance(vault_id))
+        {
+            if let Some(deadline) = entry.acceptance_deadline {
+                if now > deadline && !entry.approved_by_owner {
+                    let token_client = token::Client::new(&env, &vault.token_address);
+                    token_client.transfer(&env.current_contract_address(), &vault.owner, &total);
+                    vault.balance = 0;
+                    vault.status = ReleaseStatus::Cancelled;
+                    Self::save_vault(&env, vault_id, &vault);
+                    env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+                    env.events().publish((ACCEPTANCE_DEADLINE_EXPIRED_TOPIC,), (vault_id, vault.owner.clone(), total));
+                    return;
+                }
+            }
+        }
+
         // Check if a vesting schedule is attached
         let has_vesting = env
             .storage()
@@ -3949,6 +3968,39 @@ impl TtlVaultContract {
         env.storage()
             .persistent()
             .get::<DataKey, ConditionalAcceptanceEntry>(&DataKey::ConditionalAcceptance(vault_id))
+    }
+
+    /// Sets an acceptance deadline on the conditional acceptance entry. Owner-only.
+    ///
+    /// If the deadline passes without owner approval, trigger_release reverts funds to the owner.
+    pub fn set_acceptance_deadline(
+        env: Env,
+        vault_id: u64,
+        deadline_timestamp: u64,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+
+        let key = DataKey::ConditionalAcceptance(vault_id);
+        let mut entry = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ConditionalAcceptanceEntry>(&key)
+            .ok_or(ContractError::InvalidBeneficiary)?;
+
+        entry.acceptance_deadline = Some(deadline_timestamp);
+        env.storage().persistent().set(&key, &entry);
+        env.storage().persistent().extend_ttl(
+            &key,
+            VAULT_TTL_THRESHOLD,
+            vault_ttl_ledgers(vault.check_in_interval),
+        );
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
     }
 
     // --- Issue #399: Dispute Resolution ---
