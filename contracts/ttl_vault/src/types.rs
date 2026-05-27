@@ -58,6 +58,20 @@ pub const MULTISIG_REJECTED_TOPIC: Symbol = symbol_short!("ms_rej");
 pub const MULTISIG_EXECUTED_TOPIC: Symbol = symbol_short!("ms_exec");
 pub const MULTISIG_PROPOSAL_EXPIRY: u64 = 604_800; // 7 days
 
+// Issue #476 - Vault Metadata Encryption
+pub const METADATA_ENCRYPTED_TOPIC: Symbol = symbol_short!("meta_enc");
+pub const METADATA_DECRYPTED_TOPIC: Symbol = symbol_short!("meta_dec");
+
+// Issue #477 - Vault Deduplication
+pub const VAULT_DUPLICATE_TOPIC: Symbol = symbol_short!("v_dup");
+
+// Issue #478 - Adaptive Check-In Intervals
+pub const ADAPTIVE_INTERVAL_TOPIC: Symbol = symbol_short!("adp_intv");
+
+// Issue #479 - Check-In Streak Tracking
+pub const STREAK_UPDATED_TOPIC: Symbol = symbol_short!("streak");
+pub const STREAK_BROKEN_TOPIC: Symbol = symbol_short!("stk_brk");
+
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
 
@@ -116,6 +130,14 @@ pub enum DataKey {
     MultiSigConfig(u64),
     MultiSigProposal(u64, u64),
     MultiSigProposalCount(u64),
+    // Issue #476 - Vault Metadata Encryption
+    EncryptedMetadata(u64),
+    // Issue #477 - Vault Deduplication
+    VaultFingerprint(BytesN<32>),
+    // Issue #478 - Adaptive Check-In Intervals
+    CheckInHistory(u64),
+    // Issue #479 - Check-In Streak Tracking
+    CheckInStreak(u64),
 }
 
 /// A vesting schedule attached to a vault.
@@ -374,4 +396,30 @@ pub enum ProposalStatus {
     Rejected,
     Executed,
     Expired,
+}
+
+/// Encrypted metadata entry - Issue #476
+#[contracttype]
+#[derive(Clone)]
+pub struct EncryptedMetadata {
+    /// Encrypted metadata bytes (ciphertext)
+    pub ciphertext: Bytes,
+    /// Nonce/IV used for encryption (stored so decryption is possible)
+    pub nonce: BytesN<32>,
+    /// Whether this metadata is currently encrypted
+    pub is_encrypted: bool,
+}
+
+/// Check-in streak tracking entry - Issue #479
+#[contracttype]
+#[derive(Clone)]
+pub struct CheckInStreak {
+    /// Current consecutive check-in count
+    pub current_streak: u32,
+    /// Longest streak ever achieved
+    pub longest_streak: u32,
+    /// Timestamp of the last check-in
+    pub last_check_in: u64,
+    /// Total check-ins recorded
+    pub total_check_ins: u32,
 }

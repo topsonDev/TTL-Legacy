@@ -3539,3 +3539,250 @@ fn test_activity_log_empty_for_new_vault_before_create() {
     let log = client.get_vault_activity_log(&999u64);
     assert!(log.is_empty());
 }
+
+// ── Issue #476: Vault Metadata Encryption ────────────────────────────────────
+
+#[test]
+fn test_set_and_get_encrypted_metadata() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let ciphertext = soroban_sdk::Bytes::from_array(&env, &[1u8, 2, 3, 4, 5]);
+    let nonce = BytesN::from_array(&env, &[0u8; 32]);
+
+    client.set_encrypted_metadata(&vault_id, &owner, &ciphertext, &nonce);
+
+    let stored = client.get_encrypted_metadata(&vault_id).unwrap();
+    assert_eq!(stored.ciphertext, ciphertext);
+    assert_eq!(stored.nonce, nonce);
+    assert!(stored.is_encrypted);
+}
+
+#[test]
+fn test_set_encrypted_metadata_non_owner_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let stranger = Address::generate(&env);
+
+    let ciphertext = soroban_sdk::Bytes::from_array(&env, &[9u8; 4]);
+    let nonce = BytesN::from_array(&env, &[0u8; 32]);
+
+    let err = client
+        .try_set_encrypted_metadata(&vault_id, &stranger, &ciphertext, &nonce)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::NotOwner);
+}
+
+#[test]
+fn test_clear_encrypted_metadata() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let ciphertext = soroban_sdk::Bytes::from_array(&env, &[7u8; 8]);
+    let nonce = BytesN::from_array(&env, &[1u8; 32]);
+    client.set_encrypted_metadata(&vault_id, &owner, &ciphertext, &nonce);
+    assert!(client.get_encrypted_metadata(&vault_id).is_some());
+
+    client.clear_encrypted_metadata(&vault_id, &owner);
+    assert!(client.get_encrypted_metadata(&vault_id).is_none());
+}
+
+#[test]
+fn test_encrypted_metadata_none_when_not_set() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    assert!(client.get_encrypted_metadata(&vault_id).is_none());
+}
+
+// ── Issue #477: Vault Deduplication ──────────────────────────────────────────
+
+#[test]
+fn test_register_vault_fingerprint_success() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let fp = BytesN::from_array(&env, &[42u8; 32]);
+
+    client.register_vault_fingerprint(&vault_id, &owner, &fp);
+    assert_eq!(client.get_vault_by_fingerprint(&fp), Some(vault_id));
+}
+
+#[test]
+fn test_register_duplicate_fingerprint_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id1 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let vault_id2 = client.create_vault(&owner, &beneficiary, &7200u64, &None);
+    let fp = BytesN::from_array(&env, &[99u8; 32]);
+
+    client.register_vault_fingerprint(&vault_id1, &owner, &fp);
+
+    // Second registration with same fingerprint should fail
+    let err = client
+        .try_register_vault_fingerprint(&vault_id2, &owner, &fp)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::AlreadyInitialized);
+}
+
+#[test]
+fn test_get_vault_by_fingerprint_none_when_not_registered() {
+    let (env, _, _, _, _, client) = setup();
+    let fp = BytesN::from_array(&env, &[0u8; 32]);
+    assert!(client.get_vault_by_fingerprint(&fp).is_none());
+}
+
+#[test]
+fn test_register_fingerprint_non_owner_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let stranger = Address::generate(&env);
+    let fp = BytesN::from_array(&env, &[55u8; 32]);
+
+    let err = client
+        .try_register_vault_fingerprint(&vault_id, &stranger, &fp)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::NotOwner);
+}
+
+// ── Issue #478: Adaptive Check-In Intervals ──────────────────────────────────
+
+#[test]
+fn test_suggest_adaptive_interval_insufficient_history() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    // No check-ins yet — should return None
+    assert!(client.suggest_adaptive_interval(&vault_id).is_none());
+}
+
+#[test]
+fn test_suggest_adaptive_interval_after_check_ins() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &86400u64, &None);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+
+    // Simulate two check-ins 3600 seconds apart
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+    client.check_in(&vault_id, &owner, &passkey);
+
+    env.ledger().with_mut(|l| l.timestamp = 4600);
+    client.check_in(&vault_id, &owner, &passkey);
+
+    let suggestion = client.suggest_adaptive_interval(&vault_id);
+    assert!(suggestion.is_some());
+    assert_eq!(suggestion.unwrap(), 3600u64);
+}
+
+#[test]
+fn test_apply_adaptive_interval() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &86400u64, &None);
+    let passkey = BytesN::from_array(&env, &[2u8; 32]);
+
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+    client.check_in(&vault_id, &owner, &passkey);
+
+    env.ledger().with_mut(|l| l.timestamp = 5000);
+    client.check_in(&vault_id, &owner, &passkey);
+
+    let new_interval = client.apply_adaptive_interval(&vault_id, &owner);
+    assert_eq!(new_interval, 4000u64);
+
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.check_in_interval, 4000u64);
+}
+
+#[test]
+fn test_apply_adaptive_interval_non_owner_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let stranger = Address::generate(&env);
+
+    let err = client
+        .try_apply_adaptive_interval(&vault_id, &stranger)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::NotOwner);
+}
+
+#[test]
+fn test_get_check_in_history() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &86400u64, &None);
+    let passkey = BytesN::from_array(&env, &[3u8; 32]);
+
+    env.ledger().with_mut(|l| l.timestamp = 100);
+    client.check_in(&vault_id, &owner, &passkey);
+
+    env.ledger().with_mut(|l| l.timestamp = 200);
+    client.check_in(&vault_id, &owner, &passkey);
+
+    let history = client.get_check_in_history(&vault_id);
+    assert_eq!(history.len(), 2);
+    assert_eq!(history.get(0).unwrap(), 100u64);
+    assert_eq!(history.get(1).unwrap(), 200u64);
+}
+
+// ── Issue #479: Check-In Streak Tracking ─────────────────────────────────────
+
+#[test]
+fn test_streak_starts_at_one_after_first_check_in() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &86400u64, &None);
+    let passkey = BytesN::from_array(&env, &[4u8; 32]);
+
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+    client.check_in(&vault_id, &owner, &passkey);
+
+    let streak = client.get_check_in_streak(&vault_id).unwrap();
+    assert_eq!(streak.current_streak, 1);
+    assert_eq!(streak.total_check_ins, 1);
+}
+
+#[test]
+fn test_streak_increments_on_consecutive_check_ins() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &86400u64, &None);
+    let passkey = BytesN::from_array(&env, &[5u8; 32]);
+
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+    client.check_in(&vault_id, &owner, &passkey);
+
+    env.ledger().with_mut(|l| l.timestamp = 50000); // within 86400s interval
+    client.check_in(&vault_id, &owner, &passkey);
+
+    let streak = client.get_check_in_streak(&vault_id).unwrap();
+    assert_eq!(streak.current_streak, 2);
+    assert_eq!(streak.longest_streak, 2);
+    assert_eq!(streak.total_check_ins, 2);
+}
+
+#[test]
+fn test_streak_resets_when_interval_missed() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let interval = 3600u64;
+    let vault_id = client.create_vault(&owner, &beneficiary, &interval, &None);
+    let passkey = BytesN::from_array(&env, &[6u8; 32]);
+
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+    client.check_in(&vault_id, &owner, &passkey);
+
+    env.ledger().with_mut(|l| l.timestamp = 2000);
+    client.check_in(&vault_id, &owner, &passkey);
+
+    // Miss the interval — jump past deadline
+    env.ledger().with_mut(|l| l.timestamp = 2000 + interval + 1000);
+    client.check_in(&vault_id, &owner, &passkey);
+
+    let streak = client.get_check_in_streak(&vault_id).unwrap();
+    assert_eq!(streak.current_streak, 1); // reset
+    assert_eq!(streak.longest_streak, 2); // previous best preserved
+    assert_eq!(streak.total_check_ins, 3);
+}
+
+#[test]
+fn test_streak_none_before_any_check_in() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    assert!(client.get_check_in_streak(&vault_id).is_none());
+}
