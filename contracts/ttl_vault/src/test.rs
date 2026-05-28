@@ -4997,3 +4997,195 @@ fn test_snapshot_captures_metadata_and_interval() {
     let snap = client.get_snapshot(&vault_id, &snap_id).unwrap();
     assert_eq!(snap.check_in_interval, 7200u64);
 }
+
+// ── Countdown Notifications ──────────────────────────────────────────────────
+
+#[test]
+fn test_check_countdown_default_thresholds_no_event_when_ttl_high() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    // interval = 30 days; TTL will be ~30 days >> all thresholds
+    let vault_id = client.create_vault(&owner, &beneficiary, &(30 * 86_400u64), &None);
+    let ttl = client.check_countdown(&vault_id);
+    assert!(ttl > 604_800, "TTL should be above 7-day threshold");
+    // No cd_notif event should have been emitted
+    let events = env.events().all();
+    let found = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or(soroban_sdk::vec![&env]);
+        topics.len() > 0 && {
+            let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+            t.map(|s| s == soroban_sdk::Symbol::new(&env, "cd_notif")).unwrap_or(false)
+        }
+    });
+    assert!(!found, "No cd_notif event should fire when TTL is high");
+}
+
+#[test]
+fn test_check_countdown_emits_event_when_ttl_crosses_threshold() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    // interval = 2 days; after 1 day TTL = 1 day => crosses 1-day threshold
+    let vault_id = client.create_vault(&owner, &beneficiary, &(2 * 86_400u64), &None);
+    env.ledger().with_mut(|l| l.timestamp += 86_400); // advance 1 day
+    client.check_countdown(&vault_id);
+
+    let events = env.events().all();
+    let found = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or(soroban_sdk::vec![&env]);
+        topics.len() > 0 && {
+            let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+            t.map(|s| s == soroban_sdk::Symbol::new(&env, "cd_notif")).unwrap_or(false)
+        }
+    });
+    assert!(found, "cd_notif event should fire when TTL <= 1-day threshold");
+}
+
+#[test]
+fn test_check_countdown_fires_each_threshold_once() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &(2 * 86_400u64), &None);
+    env.ledger().with_mut(|l| l.timestamp += 86_400);
+
+    // First call — should fire
+    client.check_countdown(&vault_id);
+    let count_after_first = env.events().all().iter()
+        .filter(|e| {
+            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or(soroban_sdk::vec![&env]);
+            topics.len() > 0 && {
+                let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+                t.map(|s| s == soroban_sdk::Symbol::new(&env, "cd_notif")).unwrap_or(false)
+            }
+        })
+        .count();
+
+    // Second call — same TTL, threshold already fired, no new event
+    client.check_countdown(&vault_id);
+    let count_after_second = env.events().all().iter()
+        .filter(|e| {
+            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or(soroban_sdk::vec![&env]);
+            topics.len() > 0 && {
+                let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+                t.map(|s| s == soroban_sdk::Symbol::new(&env, "cd_notif")).unwrap_or(false)
+            }
+        })
+        .count();
+
+    assert_eq!(count_after_first, count_after_second, "Threshold should not fire twice");
+}
+
+#[test]
+fn test_check_countdown_resets_after_check_in() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &(2 * 86_400u64), &None);
+    env.ledger().with_mut(|l| l.timestamp += 86_400);
+    client.check_countdown(&vault_id);
+
+    // Owner checks in — resets TTL and clears fired flags
+    client.check_in(&vault_id, &owner, &None, &None, &None);
+    env.ledger().with_mut(|l| l.timestamp += 86_400);
+
+    // Now check_countdown should fire again for the same threshold
+    let events_before = env.events().all().len();
+    client.check_countdown(&vault_id);
+    let new_events: usize = env.events().all().iter()
+        .skip(events_before)
+        .filter(|e| {
+            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or(soroban_sdk::vec![&env]);
+            topics.len() > 0 && {
+                let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+                t.map(|s| s == soroban_sdk::Symbol::new(&env, "cd_notif")).unwrap_or(false)
+            }
+        })
+        .count();
+    assert!(new_events > 0, "Threshold should fire again after check-in resets the cycle");
+}
+
+#[test]
+fn test_set_countdown_config_custom_thresholds() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &(10 * 86_400u64), &None);
+
+    let custom = soroban_sdk::vec![&env, 3600u64, 1800u64]; // 1h, 30m
+    client.set_countdown_config(&vault_id, &owner, &custom);
+
+    let cfg = client.get_countdown_config(&vault_id);
+    assert_eq!(cfg.thresholds.len(), 2);
+    assert_eq!(cfg.thresholds.get(0).unwrap(), 3600u64);
+}
+
+#[test]
+fn test_set_countdown_config_rejects_non_owner() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let stranger = Address::generate(&env);
+    let thresholds = soroban_sdk::vec![&env, 3600u64];
+
+    let err = client.try_set_countdown_config(&vault_id, &stranger, &thresholds).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_set_countdown_config_emits_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let thresholds = soroban_sdk::vec![&env, 3600u64];
+    client.set_countdown_config(&vault_id, &owner, &thresholds);
+
+    let events = env.events().all();
+    let found = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or(soroban_sdk::vec![&env]);
+        topics.len() > 0 && {
+            let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+            t.map(|s| s == soroban_sdk::Symbol::new(&env, "set_cd")).unwrap_or(false)
+        }
+    });
+    assert!(found, "set_cd event should be emitted");
+}
+
+#[test]
+fn test_set_countdown_config_clears_fired_flags() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &(2 * 86_400u64), &None);
+    env.ledger().with_mut(|l| l.timestamp += 86_400);
+    client.check_countdown(&vault_id); // fires 1-day threshold
+
+    // Reconfigure — should clear fired flags
+    let thresholds = soroban_sdk::vec![&env, 86_400u64];
+    client.set_countdown_config(&vault_id, &owner, &thresholds);
+
+    // check_countdown should fire again since flags were cleared
+    let events_before = env.events().all().len();
+    client.check_countdown(&vault_id);
+    let new_events: usize = env.events().all().iter()
+        .skip(events_before)
+        .filter(|e| {
+            let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or(soroban_sdk::vec![&env]);
+            topics.len() > 0 && {
+                let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+                t.map(|s| s == soroban_sdk::Symbol::new(&env, "cd_notif")).unwrap_or(false)
+            }
+        })
+        .count();
+    assert!(new_events > 0, "Threshold should fire again after config reset");
+}
+
+#[test]
+fn test_check_countdown_returns_zero_for_released_vault() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&vault_id, &owner, &100_000i128);
+    env.ledger().with_mut(|l| l.timestamp += 3601);
+    client.trigger_release(&vault_id);
+
+    let ttl = client.check_countdown(&vault_id);
+    assert_eq!(ttl, 0);
+}
+
+#[test]
+fn test_get_countdown_config_returns_defaults_when_not_set() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let cfg = client.get_countdown_config(&vault_id);
+    assert_eq!(cfg.thresholds.len(), 3);
+    assert_eq!(cfg.thresholds.get(0).unwrap(), 604_800u64);
+    assert_eq!(cfg.thresholds.get(1).unwrap(), 259_200u64);
+    assert_eq!(cfg.thresholds.get(2).unwrap(), 86_400u64);
+}

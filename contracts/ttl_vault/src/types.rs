@@ -105,6 +105,10 @@ pub const TTL_REPAY_TOPIC: Symbol = symbol_short!("ttl_rep");
 pub const SNAPSHOT_CREATED_TOPIC: Symbol = symbol_short!("snap_crt");
 pub const SNAPSHOT_RESTORED_TOPIC: Symbol = symbol_short!("snap_rst");
 
+// Configurable countdown notifications
+pub const COUNTDOWN_NOTIF_TOPIC: Symbol = symbol_short!("cd_notif");
+pub const SET_COUNTDOWN_TOPIC: Symbol = symbol_short!("set_cd");
+
 // Issue: Check-in Rate Limiting
 pub const CHECKIN_RATE_LIMITED_TOPIC: Symbol = symbol_short!("ci_rl");
 
@@ -601,4 +605,15 @@ pub struct HibernationEntry {
     pub started_at: u64,
     /// How many seconds the hibernation lasts.
     pub duration_seconds: u64,
+}
+
+/// Configurable countdown notification thresholds for a vault.
+/// Each threshold (in seconds before expiry) triggers a `cd_notif` event
+/// when `check_countdown` is called and the TTL crosses that boundary.
+/// Default thresholds: 7 days (604800), 3 days (259200), 1 day (86400).
+#[contracttype]
+#[derive(Clone)]
+pub struct CountdownConfig {
+    /// Sorted descending list of thresholds in seconds (e.g. [604800, 259200, 86400]).
+    pub thresholds: Vec<u64>,
 }

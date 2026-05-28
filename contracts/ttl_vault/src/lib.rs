@@ -808,12 +808,12 @@ impl TtlVaultContract {
 
         Self::log_audit_entry(&env, vault_id, "check_in", &caller, "");
         Self::append_activity_log(&env, vault_id, "check_in", &caller, "");
+        // Reset countdown fired flags so thresholds fire again on the new cycle
+        env.storage().persistent().remove(&DataKey::CountdownFired(vault_id));
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events().publish((CHECK_IN_TOPIC, vault_id), vault.last_check_in);
         Ok(())
     }
-
-    /// Deposits funds into a vault.
     ///
     /// Transfers tokens from the caller to the contract and increases the vault's balance.
     /// The vault must be in Locked status.
@@ -6333,5 +6333,96 @@ impl TtlVaultContract {
         env.storage()
             .persistent()
             .get(&DataKey::Hibernation(vault_id))
+    }
+
+    // ── Configurable Countdown Notifications ────────────────────────────────
+
+    /// Sets the countdown notification thresholds for a vault.
+    ///
+    /// Only the vault owner may call this. Thresholds are seconds-before-expiry
+    /// values at which `check_countdown` will emit a `cd_notif` event.
+    /// Pass an empty vec to disable countdown notifications.
+    /// Default thresholds when not configured: 604800 (7d), 259200 (3d), 86400 (1d).
+    ///
+    /// # Arguments
+    /// * `vault_id`   - The vault to configure
+    /// * `caller`     - Must be the vault owner (requires auth)
+    /// * `thresholds` - Seconds-before-expiry values (duplicates ignored; max 10 entries)
+    pub fn set_countdown_config(env: Env, vault_id: u64, caller: Address, thresholds: Vec<u64>) {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            panic_with_error!(&env, ContractError::NotOwner);
+        }
+        let config = CountdownConfig { thresholds: thresholds.clone() };
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        let key = DataKey::CountdownConfig(vault_id);
+        env.storage().persistent().set(&key, &config);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        // Reset fired flags so new thresholds can fire fresh
+        env.storage().persistent().remove(&DataKey::CountdownFired(vault_id));
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((SET_COUNTDOWN_TOPIC, vault_id), thresholds);
+    }
+
+    /// Returns the countdown config for a vault, or the default (7d/3d/1d) if not set.
+    pub fn get_countdown_config(env: Env, vault_id: u64) -> CountdownConfig {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CountdownConfig(vault_id))
+            .unwrap_or_else(|| {
+                let mut t = Vec::new(&env);
+                t.push_back(604_800u64); // 7 days
+                t.push_back(259_200u64); // 3 days
+                t.push_back(86_400u64);  // 1 day
+                CountdownConfig { thresholds: t }
+            })
+    }
+
+    /// Checks the vault TTL against configured thresholds and emits `cd_notif`
+    /// events for each threshold that has been crossed since the last call.
+    ///
+    /// Can be called by anyone (e.g. a cron job or off-chain keeper). Each
+    /// threshold fires at most once per countdown cycle; fired flags are cleared
+    /// when the owner calls `check_in` (TTL resets) or `set_countdown_config`.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault to check
+    ///
+    /// # Returns
+    /// The remaining TTL in seconds (0 if expired or vault not Locked)
+    pub fn check_countdown(env: Env, vault_id: u64) -> u64 {
+        let vault = Self::try_load_vault(&env, vault_id)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::VaultNotFound));
+
+        if vault.status != ReleaseStatus::Locked {
+            return 0;
+        }
+
+        let ttl = Self::get_ttl_remaining(env.clone(), vault_id).unwrap_or(0);
+        let config = Self::get_countdown_config(env.clone(), vault_id);
+
+        // Load bitmask of already-fired thresholds (indexed by position in config.thresholds)
+        let fired_key = DataKey::CountdownFired(vault_id);
+        let mut fired: u32 = env.storage().persistent().get(&fired_key).unwrap_or(0u32);
+        let mut updated = false;
+
+        for (i, threshold) in config.thresholds.iter().enumerate() {
+            let bit = 1u32 << (i as u32);
+            if fired & bit == 0 && ttl <= threshold {
+                env.events().publish((COUNTDOWN_NOTIF_TOPIC, vault_id), (threshold, ttl));
+                fired |= bit;
+                updated = true;
+            }
+        }
+
+        if updated {
+            let ttl_ledgers = vault_ttl_ledgers(vault.check_in_interval);
+            env.storage().persistent().set(&fired_key, &fired);
+            env.storage().persistent().extend_ttl(&fired_key, VAULT_TTL_THRESHOLD, ttl_ledgers);
+            env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        }
+
+        ttl
     }
 }
