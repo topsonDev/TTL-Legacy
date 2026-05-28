@@ -3700,6 +3700,72 @@ fn test_vault_capacity_zero_means_unlimited() {
     assert_eq!(client.vault_count(), 3u64);
 }
 
+// ---- Beneficiary Capacity Limits ----
+
+#[test]
+fn test_beneficiary_vault_limit_enforced() {
+    let (env, owner, beneficiary, _admin, _, client) = setup();
+    client.set_beneficiary_vault_limit(&2u32);
+    assert_eq!(client.get_beneficiary_vault_limit(), 2u32);
+
+    let owner2 = Address::generate(&env);
+    let owner3 = Address::generate(&env);
+    // Two vaults with the same beneficiary — should succeed
+    client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.create_vault(&owner2, &beneficiary, &3600u64, &None);
+
+    // Third vault with the same beneficiary should fail
+    let err = client.try_create_vault(&owner3, &beneficiary, &3600u64, &None).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(55)); // BeneficiaryCapacityExceeded
+}
+
+#[test]
+fn test_beneficiary_vault_limit_zero_means_unlimited() {
+    let (env, owner, beneficiary, _admin, _, client) = setup();
+    client.set_beneficiary_vault_limit(&0u32); // unlimited
+
+    let owner2 = Address::generate(&env);
+    let owner3 = Address::generate(&env);
+    client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.create_vault(&owner2, &beneficiary, &3600u64, &None);
+    client.create_vault(&owner3, &beneficiary, &3600u64, &None);
+    assert_eq!(client.vault_count(), 3u64);
+}
+
+#[test]
+fn test_beneficiary_vault_limit_emits_event() {
+    let (env, _owner, _beneficiary, _admin, _, client) = setup();
+    client.set_beneficiary_vault_limit(&5u32);
+    let events = env.events().all();
+    let last = events.last().unwrap();
+    // topic is (BENEFICIARY_CAP_TOPIC,), data is 5u32
+    let data: u32 = last.1.try_into_val(&env).unwrap();
+    assert_eq!(data, 5u32);
+}
+
+#[test]
+fn test_apply_beneficiary_update_respects_limit() {
+    let (env, owner, beneficiary, _admin, _, client) = setup();
+    client.set_beneficiary_vault_limit(&1u32);
+
+    // beneficiary is already assigned to vault1
+    let vault1 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    // Create vault2 with a different beneficiary, then try to update it to `beneficiary`
+    let other = Address::generate(&env);
+    let vault2 = client.create_vault(&owner, &other, &3600u64, &None);
+
+    // Initiate update — this just queues it (no cap check yet)
+    client.update_beneficiary(&vault2, &owner, &beneficiary).unwrap();
+
+    // Advance past the 24h timelock
+    env.ledger().with_mut(|l| l.timestamp = 90_000);
+
+    // Applying should fail — beneficiary already at limit
+    let err = client.try_apply_beneficiary_update(&vault2, &owner).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(55)); // BeneficiaryCapacityExceeded
+}
+
 // ---- Issue #471: Vault Merge Validation ----
 
 #[test]

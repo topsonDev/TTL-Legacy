@@ -98,6 +98,9 @@ pub const TTL_REPAY_TOPIC: Symbol = symbol_short!("ttl_rep");
 // Issue: Check-in Rate Limiting
 pub const CHECKIN_RATE_LIMITED_TOPIC: Symbol = symbol_short!("ci_rl");
 
+// Beneficiary capacity limit
+pub const BENEFICIARY_CAP_TOPIC: Symbol = symbol_short!("ben_cap");
+
 // Issue: Accelerated TTL Decay
 pub const TTL_ACCELERATE_TOPIC: Symbol = symbol_short!("ttl_acc");
 
@@ -180,6 +183,8 @@ pub enum DataKey {
     // Issue #499: beneficiary release votes
     ReleaseVotes(u64),
     ReleaseVoteThreshold(u64),
+    // Beneficiary capacity limit
+    BeneficiaryVaultLimit,
 }
 
 /// Check-in history entry for TTL prediction - Issue #482

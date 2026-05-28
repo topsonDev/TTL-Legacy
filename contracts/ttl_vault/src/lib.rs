@@ -31,7 +31,7 @@ use types::{
     MULTISIG_EXECUTED_TOPIC, MULTISIG_PROPOSAL_EXPIRY, OWNERSHIP_INITIATED_TOPIC, OWNERSHIP_ACCEPTED_TOPIC,
     OWNERSHIP_CANCELLED_TOPIC,
     MetadataVersionEntry, META_VERSION_TOPIC, META_REVERT_TOPIC, VAULT_ARCHIVED_TOPIC,
-    VAULT_CAP_TOPIC,
+    VAULT_CAP_TOPIC, BENEFICIARY_CAP_TOPIC,
     CheckInHistoryEntry, CheckInStreak,
     DELEGATE_CHECKIN_TOPIC, REVOKE_DELEGATE_TOPIC, CHECKIN_POW_TOPIC, TTL_PREDICTED_TOPIC,
     BATCH_CHECKIN_TOPIC,
@@ -148,6 +148,7 @@ pub enum ContractError {
     ProofOfLifeExpired = 52,
     AlreadyVoted = 53,
     VotingNotEnabled = 54,
+    BeneficiaryCapacityExceeded = 55,
 }
 
 #[contract]
@@ -613,6 +614,9 @@ impl TtlVaultContract {
                     panic_with_error!(&env, ContractError::VaultCapacityExceeded);
                 }
             }
+
+            // Enforce per-beneficiary vault capacity limit
+            Self::assert_beneficiary_capacity(&env, &beneficiary);
 
             // Use provided token or default to contract's XLM token
             let vault_token = match token_address {
@@ -2469,6 +2473,12 @@ impl TtlVaultContract {
 
         let old_beneficiary = vault.beneficiary.clone();
         let new_beneficiary = pending.new_beneficiary.clone();
+
+        // Enforce beneficiary capacity only when the beneficiary actually changes
+        if old_beneficiary != new_beneficiary {
+            Self::assert_beneficiary_capacity(&env, &new_beneficiary);
+        }
+
         vault.beneficiary = new_beneficiary.clone();
         Self::save_vault(&env, vault_id, &vault);
 
@@ -5303,6 +5313,39 @@ impl TtlVaultContract {
             .instance()
             .get(&DataKey::OwnerVaultCount(env.current_contract_address()))
             .unwrap_or(0u32)
+    }
+
+    // ── Beneficiary Capacity Limits ───────────────────────────────────────────
+
+    /// Sets the maximum number of vaults a single beneficiary may be assigned to.
+    ///
+    /// Admin-only. A value of 0 removes the limit.
+    pub fn set_beneficiary_vault_limit(env: Env, limit: u32) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&DataKey::BeneficiaryVaultLimit, &limit);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((BENEFICIARY_CAP_TOPIC,), limit);
+    }
+
+    /// Returns the configured per-beneficiary vault limit (0 = unlimited).
+    pub fn get_beneficiary_vault_limit(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::BeneficiaryVaultLimit)
+            .unwrap_or(0u32)
+    }
+
+    fn assert_beneficiary_capacity(env: &Env, beneficiary: &Address) {
+        let limit: u32 = env.storage()
+            .instance()
+            .get(&DataKey::BeneficiaryVaultLimit)
+            .unwrap_or(0u32);
+        if limit > 0 {
+            let count = Self::load_beneficiary_vault_ids(env, beneficiary).len() as u32;
+            if count >= limit {
+                panic_with_error!(env, ContractError::BeneficiaryCapacityExceeded);
+            }
+        }
     }
 
     // ── Issue #471: Vault Merge Validation ───────────────────────────────────
