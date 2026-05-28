@@ -744,12 +744,9 @@ impl TtlVaultContract {
             }
         }
 
-        if let Some(expiry) = Self::get_passkey_expiry(env.clone(), vault_id, passkey_hash.clone()) {
-            if now > expiry {
-                return Err(ContractError::InvalidPasskey);
-            }
-        }
-        
+        // Issue #549: enforce passkey registration and expiry.
+        Self::validate_passkey_for_checkin(&env, vault_id, &vault, &passkey_hash, now)?;
+
         vault.last_check_in = now;
         
         // Cap TTL at max_ttl_seconds
@@ -3946,6 +3943,57 @@ impl TtlVaultContract {
         }
     }
 
+    // --- Issue #549: Passkey Expiry Enforcement ---
+
+    /// Validates that `passkey_hash` is registered for `vault_id` and not expired.
+    ///
+    /// Registration rules (backwards-compatible):
+    /// - If `VaultPasskeys` list is non-empty, the hash must appear in that list.
+    /// - If the list is empty AND `vault.passkey_hash` is Some, the hash must match it.
+    /// - If both are empty/None, any passkey is accepted (no passkey configured yet).
+    ///
+    /// Expiry: if `PasskeyExpiry` is stored for this hash, it must not be in the past.
+    fn validate_passkey_for_checkin(
+        env: &Env,
+        vault_id: u64,
+        vault: &Vault,
+        passkey_hash: &BytesN<32>,
+        now: u64,
+    ) -> Result<(), ContractError> {
+        let pk_key = DataKey::VaultPasskeys(vault_id);
+        let passkeys: Vec<PasskeyHash> = env
+            .storage()
+            .persistent()
+            .get(&pk_key)
+            .unwrap_or_else(|| Vec::new(env));
+
+        if !passkeys.is_empty() {
+            // Multi-passkey list is configured — hash must be in it.
+            let registered = passkeys.iter().any(|p| &p.hash == passkey_hash);
+            if !registered {
+                return Err(ContractError::InvalidPasskey);
+            }
+        } else if let Some(ref primary) = vault.passkey_hash {
+            // Fallback: single primary passkey on vault struct.
+            if primary != passkey_hash {
+                return Err(ContractError::InvalidPasskey);
+            }
+        }
+        // else: no passkey configured — any hash accepted for backwards compat.
+
+        // Expiry check — applies regardless of registration path.
+        if let Some(expiry) = env.storage().persistent()
+            .get::<DataKey, u64>(&DataKey::PasskeyExpiry(vault_id, passkey_hash.clone()))
+        {
+            if now > expiry {
+                env.events().publish((PASSKEY_EXPIRED_TOPIC, vault_id), passkey_hash.clone());
+                return Err(ContractError::PasskeyExpired);
+            }
+        }
+
+        Ok(())
+    }
+
     // --- Issue #395: Passkey Usage Analytics ---
 
     /// Logs a passkey usage entry for a vault check-in
@@ -5648,12 +5696,9 @@ impl TtlVaultContract {
             if vault.status != ReleaseStatus::Locked {
                 return Err(ContractError::AlreadyReleased);
             }
-            // Passkey expiry check
-            if let Some(expiry) = Self::get_passkey_expiry(env.clone(), vault_id, passkey_hash.clone()) {
-                if now > expiry {
-                    return Err(ContractError::InvalidPasskey);
-                }
-            }
+            // Issue #549: enforce passkey registration and expiry.
+            let vault_inner = Self::load_vault(&env, vault_id);
+            Self::validate_passkey_for_checkin(&env, vault_id, &vault_inner, &passkey_hash, now)?;
             // TTL cap check
             let deadline = now + vault.check_in_interval;
             let max_deadline = now + max_ttl;
@@ -5763,12 +5808,8 @@ impl TtlVaultContract {
 
         let now = env.ledger().timestamp();
 
-        // Passkey expiry check
-        if let Some(expiry) = Self::get_passkey_expiry(env.clone(), vault_id, passkey_hash.clone()) {
-            if now > expiry {
-                return Err(ContractError::InvalidPasskey);
-            }
-        }
+        // Issue #549: enforce passkey registration and expiry.
+        Self::validate_passkey_for_checkin(&env, vault_id, &vault, &passkey_hash, now)?;
 
         // Proof-of-work: hash(vault_id || last_check_in || nonce) must have `difficulty` leading zero bits
         let difficulty = difficulty.min(20); // cap at 20 bits
