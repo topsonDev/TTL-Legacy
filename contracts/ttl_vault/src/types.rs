@@ -606,7 +606,7 @@ pub struct VestingPenaltyConfig {
 }
 
 /// Pending vesting claim — Issue #548.
-/// Created by `claim_vested_installment`; tokens remain escrowed until
+/// Created by `initiate_vesting_claim`; tokens remain escrowed until
 /// `finalize_vesting_claim` is called or the owner calls `reverse_vesting_claim`.
 #[contracttype]
 #[derive(Clone)]
@@ -617,6 +617,8 @@ pub struct VestingPendingClaim {
     pub initiated_at: u64,
     /// Timestamp after which only finalization is possible (reversal window closed).
     pub reversal_deadline: u64,
-    /// Schedule counter position at the time of this claim (for idempotency).
-    pub installments_claimed: u32,
+    /// New schedule counter value set when this claim was initiated.
+    pub new_installments_claimed: u32,
+    /// Previous schedule counter value (restored on reversal).
+    pub prev_installments_claimed: u32,
 }

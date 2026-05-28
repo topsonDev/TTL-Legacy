@@ -1942,6 +1942,207 @@ impl TtlVaultContract {
         env.storage().persistent().get(&DataKey::VestingPenalty(vault_id))
     }
 
+    // --- Issue #548: Vesting Reversal ---
+
+    /// Initiates a reversible vesting claim, holding tokens in escrow for a grace period.
+    ///
+    /// Unlike `claim_vested_installment` (which transfers immediately), this function
+    /// calculates the claimable amount and stores a `VestingPendingClaim` record without
+    /// transferring any tokens. The vault owner may call `reverse_vesting_claim` within
+    /// `reversal_window_seconds` to cancel. After the window, anyone may call
+    /// `finalize_vesting_claim` to complete the transfer.
+    ///
+    /// Only one pending claim may exist per vault at a time; subsequent calls fail until
+    /// the pending claim is finalized or reversed.
+    ///
+    /// # Arguments
+    /// * `vault_id`               - The released vault with a vesting schedule
+    /// * `reversal_window_seconds`- Grace period in seconds (must be > 0)
+    ///
+    /// # Returns
+    /// The escrowed amount (not yet transferred).
+    ///
+    /// # Errors
+    /// * `ContractError::Paused`              - Contract is paused
+    /// * `ContractError::VestingNotFound`     - No schedule on this vault
+    /// * `ContractError::NothingToClaimYet`   - No installments available
+    /// * `ContractError::VestingAlreadyComplete` - All installments claimed
+    /// * `ContractError::InvalidInterval`     - reversal_window_seconds is 0
+    /// * `ContractError::InvalidAmount`       - A pending claim already exists
+    pub fn initiate_vesting_claim(
+        env: Env,
+        vault_id: u64,
+        reversal_window_seconds: u64,
+    ) -> Result<i128, ContractError> {
+        Self::assert_not_paused(&env);
+        if reversal_window_seconds == 0 {
+            return Err(ContractError::InvalidInterval);
+        }
+        // Block if a pending claim already exists.
+        if env.storage().persistent().has(&DataKey::VestingPendingClaim(vault_id)) {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let vault = Self::load_vault(&env, vault_id);
+        if vault.status != ReleaseStatus::Released {
+            return Err(ContractError::AlreadyReleased);
+        }
+
+        let mut schedule: VestingSchedule = env
+            .storage().persistent()
+            .get(&DataKey::VestingSchedule(vault_id))
+            .ok_or(ContractError::VestingNotFound)?;
+
+        if schedule.claimed_installments >= schedule.num_installments {
+            return Err(ContractError::VestingAlreadyComplete);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < schedule.start_time {
+            return Err(ContractError::NothingToClaimYet);
+        }
+
+        let elapsed = now - schedule.start_time;
+        let unlocked = ((elapsed / schedule.interval) + 1)
+            .min(schedule.num_installments as u64) as u32;
+        let claimable = unlocked.saturating_sub(schedule.claimed_installments);
+        if claimable == 0 {
+            return Err(ContractError::NothingToClaimYet);
+        }
+
+        let per_installment = schedule.total_amount / schedule.num_installments as i128;
+        let amount = if unlocked >= schedule.num_installments {
+            vault.balance
+        } else {
+            per_installment * claimable as i128
+        };
+
+        let beneficiary = if vault.beneficiaries.is_empty() {
+            vault.beneficiary.clone()
+        } else {
+            vault.beneficiaries.get(0).unwrap().address.clone()
+        };
+
+        let prev_installments_claimed = schedule.claimed_installments;
+
+        // Advance the schedule counter so a second call is blocked until this claim
+        // is finalized or reversed.
+        schedule.claimed_installments = unlocked;
+        let sched_key = DataKey::VestingSchedule(vault_id);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&sched_key, &schedule);
+        env.storage().persistent().extend_ttl(&sched_key, VAULT_TTL_THRESHOLD, ttl);
+
+        let pending = VestingPendingClaim {
+            amount,
+            beneficiary,
+            initiated_at: now,
+            reversal_deadline: now + reversal_window_seconds,
+            new_installments_claimed: unlocked,
+            prev_installments_claimed,
+        };
+        let pk = DataKey::VestingPendingClaim(vault_id);
+        env.storage().persistent().set(&pk, &pending);
+        env.storage().persistent().extend_ttl(&pk, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(amount)
+    }
+
+    /// Reverses a pending vesting claim within the reversal window.
+    ///
+    /// Only the vault owner may call this. The pending claim record is cleared and
+    /// the schedule counter is rolled back so the installments become claimable again.
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner`            - Caller is not the vault owner
+    /// * `ContractError::VestingReversalNotFound` - No pending claim on this vault
+    /// * `ContractError::VestingReversalExpired`  - Reversal window has closed
+    pub fn reverse_vesting_claim(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let pk = DataKey::VestingPendingClaim(vault_id);
+        let pending: VestingPendingClaim = env
+            .storage().persistent()
+            .get(&pk)
+            .ok_or(ContractError::VestingReversalNotFound)?;
+
+        let now = env.ledger().timestamp();
+        if now > pending.reversal_deadline {
+            return Err(ContractError::VestingReversalExpired);
+        }
+
+        // Roll back the schedule counter so these installments can be claimed again.
+        let sched_key = DataKey::VestingSchedule(vault_id);
+        if let Some(mut schedule) = env.storage().persistent()
+            .get::<DataKey, VestingSchedule>(&sched_key)
+        {
+            schedule.claimed_installments = pending.prev_installments_claimed;
+            let ttl = vault_ttl_ledgers(vault.check_in_interval);
+            env.storage().persistent().set(&sched_key, &schedule);
+            env.storage().persistent().extend_ttl(&sched_key, VAULT_TTL_THRESHOLD, ttl);
+        }
+
+        env.storage().persistent().remove(&pk);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((VESTING_REVERSED_TOPIC, vault_id), pending.amount);
+        Ok(())
+    }
+
+    /// Finalizes a pending vesting claim after the reversal window has closed.
+    ///
+    /// Anyone may call this. Transfers the escrowed amount to the beneficiary and
+    /// clears the pending claim record.
+    ///
+    /// # Errors
+    /// * `ContractError::VestingReversalNotFound` - No pending claim on this vault
+    /// * `ContractError::InvalidInterval`         - Reversal window has not yet closed
+    pub fn finalize_vesting_claim(env: Env, vault_id: u64) -> Result<i128, ContractError> {
+        Self::assert_not_paused(&env);
+
+        let pk = DataKey::VestingPendingClaim(vault_id);
+        let pending: VestingPendingClaim = env
+            .storage().persistent()
+            .get(&pk)
+            .ok_or(ContractError::VestingReversalNotFound)?;
+
+        let now = env.ledger().timestamp();
+        if now <= pending.reversal_deadline {
+            return Err(ContractError::InvalidInterval);
+        }
+
+        let mut vault = Self::load_vault(&env, vault_id);
+        if vault.balance < pending.amount {
+            return Err(ContractError::InsufficientBalance);
+        }
+
+        let token_client = token::Client::new(&env, &vault.token_address);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &pending.beneficiary,
+            &pending.amount,
+        );
+
+        vault.balance -= pending.amount;
+        Self::save_vault(&env, vault_id, &vault);
+        env.storage().persistent().remove(&pk);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((VESTING_FINALIZED_TOPIC, vault_id), pending.amount);
+        Ok(pending.amount)
+    }
+
+    /// Returns the pending vesting claim for a vault, if one exists.
+    pub fn get_pending_vesting_claim(env: Env, vault_id: u64) -> Option<VestingPendingClaim> {
+        env.storage().persistent().get(&DataKey::VestingPendingClaim(vault_id))
+    }
+
     /// Claims all vested installments that have become available since the last claim.
     ///
     /// The vault must have been released (trigger_release called) and a vesting schedule
