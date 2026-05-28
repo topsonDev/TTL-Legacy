@@ -661,6 +661,8 @@ impl TtlVaultContract {
                 max_deposit_amount: None,
                 withdrawal_approval_threshold: None,
                 spending_limit: None,
+                inactivity_penalty_bps: None,
+                penalty_recipient: None,
             };
             Self::save_vault(&env, vault_id, &vault);
             Self::add_owner_vault_id(&env, &owner, vault_id, check_in_interval);
@@ -760,6 +762,22 @@ impl TtlVaultContract {
         
         vault.last_check_in = now;
         
+        // Inactivity penalty: deduct per missed check-in interval
+        if let (Some(penalty_bps), Some(recipient)) = (vault.inactivity_penalty_bps, vault.penalty_recipient.clone()) {
+            let elapsed = now.saturating_sub(original_last_check_in);
+            let missed = (elapsed / vault.check_in_interval).saturating_sub(1);
+            if missed > 0 && vault.balance > 0 {
+                let penalty_per = vault.balance * (penalty_bps as i128) / 10_000;
+                let total_penalty = (penalty_per * missed as i128).min(vault.balance);
+                if total_penalty > 0 {
+                    let token_client = token::Client::new(&env, &vault.token_address);
+                    token_client.transfer(&env.current_contract_address(), &recipient, &total_penalty);
+                    vault.balance -= total_penalty;
+                    env.events().publish((INACTIVITY_PENALTY_TOPIC, vault_id), (total_penalty, recipient));
+                }
+            }
+        }
+
         // Cap TTL at max_ttl_seconds
         let max_ttl = Self::get_max_ttl_seconds(env.clone());
         let deadline = now + vault.check_in_interval;
@@ -3110,6 +3128,8 @@ impl TtlVaultContract {
             max_deposit_amount: None,
             withdrawal_approval_threshold: None,
             spending_limit: None,
+            inactivity_penalty_bps: None,
+            penalty_recipient: None,
         };
         
         Self::save_vault(&env, vault_id, &new_vault);

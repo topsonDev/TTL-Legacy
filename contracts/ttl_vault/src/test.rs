@@ -4390,3 +4390,115 @@ fn test_trigger_release_future_rotation_not_applied() {
     assert_eq!(token.balance(&beneficiary), 1_000);
     assert_eq!(token.balance(&new_ben), 0);
 }
+
+// ── Inactivity Penalty Tests ──────────────────────────────────────────────────
+
+#[test]
+fn test_set_inactivity_penalty_stores_config() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let recipient = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.set_inactivity_penalty(&id, &owner, &500u32, &recipient);
+    let vault = client.get_vault(&id);
+    assert_eq!(vault.inactivity_penalty_bps, Some(500));
+    assert_eq!(vault.penalty_recipient, Some(recipient));
+}
+
+#[test]
+fn test_set_inactivity_penalty_non_owner_rejected() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let err = client.try_set_inactivity_penalty(&id, &stranger, &500u32, &stranger)
+        .unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_set_inactivity_penalty_over_10000_rejected() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let recipient = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let err = client.try_set_inactivity_penalty(&id, &owner, &10_001u32, &recipient)
+        .unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(5)); // InvalidAmount
+}
+
+#[test]
+fn test_set_inactivity_penalty_zero_disables() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let recipient = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.set_inactivity_penalty(&id, &owner, &500u32, &recipient);
+    client.set_inactivity_penalty(&id, &owner, &0u32, &recipient);
+    let vault = client.get_vault(&id);
+    assert_eq!(vault.inactivity_penalty_bps, None);
+    assert_eq!(vault.penalty_recipient, None);
+}
+
+#[test]
+fn test_check_in_deducts_penalty_for_missed_intervals() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let recipient = Address::generate(&env);
+    let interval = 1000u64;
+    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &10_000);
+    client.deposit(&id, &owner, &10_000);
+    // 500 bps = 5% per missed interval
+    client.set_inactivity_penalty(&id, &owner, &500u32, &recipient);
+
+    // Advance 3 intervals (2 missed = 3 elapsed - 1 current)
+    env.ledger().with_mut(|l| { l.timestamp = interval * 3; });
+
+    let dummy_hash = BytesN::from_array(&env, &[0u8; 32]);
+    client.check_in(&id, &owner, &dummy_hash);
+
+    let token = token::Client::new(&env, &token_address);
+    // 2 missed intervals × 5% of 10_000 = 1_000 penalty
+    assert_eq!(token.balance(&recipient), 1_000);
+    assert_eq!(client.get_vault(&id).balance, 9_000);
+}
+
+#[test]
+fn test_check_in_no_penalty_when_on_time() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let recipient = Address::generate(&env);
+    let interval = 1000u64;
+    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &10_000);
+    client.deposit(&id, &owner, &10_000);
+    client.set_inactivity_penalty(&id, &owner, &500u32, &recipient);
+
+    // Advance less than one interval (no missed intervals)
+    env.ledger().with_mut(|l| { l.timestamp = interval / 2; });
+
+    let dummy_hash = BytesN::from_array(&env, &[0u8; 32]);
+    client.check_in(&id, &owner, &dummy_hash);
+
+    let token = token::Client::new(&env, &token_address);
+    assert_eq!(token.balance(&recipient), 0);
+    assert_eq!(client.get_vault(&id).balance, 10_000);
+}
+
+#[test]
+fn test_check_in_penalty_capped_at_balance() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let recipient = Address::generate(&env);
+    let interval = 100u64;
+    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &100);
+    client.deposit(&id, &owner, &100);
+    // 5000 bps = 50% per missed interval, many missed → would exceed balance
+    client.set_inactivity_penalty(&id, &owner, &5_000u32, &recipient);
+
+    // Advance 100 intervals (99 missed)
+    env.ledger().with_mut(|l| { l.timestamp = interval * 100; });
+
+    let dummy_hash = BytesN::from_array(&env, &[0u8; 32]);
+    client.check_in(&id, &owner, &dummy_hash);
+
+    let token = token::Client::new(&env, &token_address);
+    // Penalty capped at full balance
+    assert_eq!(token.balance(&recipient), 100);
+    assert_eq!(client.get_vault(&id).balance, 0);
+}

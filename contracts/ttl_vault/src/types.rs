@@ -111,6 +111,9 @@ pub const FREEZE_RESOLVED_TOPIC: Symbol = symbol_short!("frz_res");
 // Beneficiary rotation
 pub const BEN_ROTATION_TOPIC: Symbol = symbol_short!("ben_rot");
 
+// Inactivity penalty
+pub const INACTIVITY_PENALTY_TOPIC: Symbol = symbol_short!("inact_pen");
+
 // Issue: Geographic Check-in Tracking
 pub const CHECKIN_GEO_TOPIC: Symbol = symbol_short!("ci_geo");
 
@@ -359,6 +362,10 @@ pub struct Vault {
     pub withdrawal_approval_threshold: Option<i128>,
     /// Maximum amount releasable per trigger_release call - Issue #382
     pub spending_limit: Option<i128>,
+    /// Penalty in basis points deducted per missed check-in interval
+    pub inactivity_penalty_bps: Option<u32>,
+    /// Address that receives inactivity penalty transfers
+    pub penalty_recipient: Option<Address>,
 }
 
 /// Passkey usage entry for tracking check-ins - Issue #395
