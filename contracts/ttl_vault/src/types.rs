@@ -171,6 +171,17 @@ pub const ARBITRATION_RULED_TOPIC: Symbol = symbol_short!("arb_rul");
 // Issue #497: Beneficiary Notification
 pub const VAULT_NOTIFY_TOPIC: Symbol = symbol_short!("v_notif");
 
+// Issue #569: Withdrawal Audit Trail
+pub const WITHDRAWAL_AUDIT_TOPIC: Symbol = symbol_short!("wd_audit");
+pub const WITHDRAWAL_FAILED_TOPIC: Symbol = symbol_short!("wd_fail");
+
+// Issue #571: Withdrawal Notifications
+pub const WITHDRAWAL_NOTIF_TOPIC: Symbol = symbol_short!("wd_notif");
+
+// Issue #572: Withdrawal Dispute
+pub const WITHDRAWAL_DISPUTE_FILED_TOPIC: Symbol = symbol_short!("wd_disp");
+pub const WITHDRAWAL_DISPUTE_RESOLVED_TOPIC: Symbol = symbol_short!("wd_disp_res");
+
 pub const BENEFICIARY_TRIGGER_SET_TOPIC: Symbol = symbol_short!("ben_trg");
 pub const BENEFICIARY_TIER_SET_TOPIC: Symbol = symbol_short!("ben_tier");
 pub const BENEFICIARY_WATERFALL_TOPIC: Symbol = symbol_short!("ben_wfl");
@@ -652,6 +663,31 @@ pub struct AuditEntry {
     pub operation: String,
     pub actor: Address,
     pub details: String,
+}
+
+/// Withdrawal audit trail entry - Issue #569
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalAuditEntry {
+    pub vault_id: u64,
+    pub caller: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+    pub success: bool,
+    pub error_reason: String,
+}
+
+/// Withdrawal dispute entry - Issue #572
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalDispute {
+    pub vault_id: u64,
+    pub withdrawal_timestamp: u64,
+    pub dispute_filed_at: u64,
+    pub dispute_expires_at: u64,
+    pub status: DisputeStatus,
+    pub reason: String,
+    pub resolved_at: Option<u64>,
 }
 
 /// Multi-signature configuration
