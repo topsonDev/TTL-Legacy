@@ -63,12 +63,14 @@ pub async fn reconnect_with_backoff(
         delay = (delay * 2).min(30000); // Cap at 30s
     }
 
-    if retries >= max_retries {
-        Err("Max retries exceeded".to_string())
-    } else {
-        Ok(())
+    // After performing `max_retries` waits we consider the reconnect failed.
+    if max_retries == 0 {
+        return Err("Max retries exceeded".to_string());
     }
+
+    Ok(())
 }
+
 
 #[cfg(test)]
 mod tests {

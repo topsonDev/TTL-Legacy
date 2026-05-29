@@ -433,7 +433,7 @@ pub fn set_notification_preferences_handler(
     notif_store: &NotificationStore,
     vault_id: &str,
     request: NotificationPreferencesRequest,
-) -> Result<NotificationPreferences, String> {
+) -> Result<VaultNotificationPreferences, String> {
     if request.channels.is_empty() {
         return Err("At least one notification channel is required".to_string());
     }
@@ -445,8 +445,9 @@ pub fn set_notification_preferences_handler(
         .get(vault_id)
         .ok_or_else(|| "Vault not found".to_string())?;
 
-    let prefs = NotificationPreferences {
+    let prefs = VaultNotificationPreferences {
         vault_id: vault_id.to_string(),
+
         channels: request.channels,
         frequency: request.frequency,
         updated_at: Utc::now(),
@@ -460,7 +461,7 @@ pub fn set_notification_preferences_handler(
 pub fn get_notification_preferences_handler(
     notif_store: &NotificationStore,
     vault_id: &str,
-) -> Option<NotificationPreferences> {
+) -> Option<VaultNotificationPreferences> {
     get_notification_preferences(notif_store, vault_id)
 }
 

@@ -1,7 +1,9 @@
 use crate::models::{
     Vault, VaultEvent, AuditEntry, SearchQuery, SearchResult, VaultStatus,
-    VaultBackup, VaultShare, NotificationPreferences,
+    VaultBackup, VaultShare, VaultNotificationPreferences,
+    ReminderPreferences, Channel, Frequency,
 };
+
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -11,7 +13,8 @@ pub type EventStore = Arc<Mutex<Vec<VaultEvent>>>;
 pub type AuditStore = Arc<Mutex<Vec<AuditEntry>>>;
 pub type BackupStore = Arc<Mutex<HashMap<String, VaultBackup>>>;
 pub type ShareStore = Arc<Mutex<Vec<VaultShare>>>;
-pub type NotificationStore = Arc<Mutex<HashMap<String, NotificationPreferences>>>;
+pub type NotificationStore = Arc<Mutex<HashMap<String, VaultNotificationPreferences>>>;
+
 
 pub fn create_vault_store() -> VaultStore {
     Arc::new(Mutex::new(HashMap::new()))
@@ -208,7 +211,8 @@ pub fn get_vault_shares(share_store: &ShareStore, vault_id: &str) -> Vec<crate::
 
 pub fn set_notification_preferences(
     notif_store: &NotificationStore,
-    prefs: crate::models::NotificationPreferences,
+    prefs: crate::models::VaultNotificationPreferences,
+
 ) {
     notif_store.lock().unwrap().insert(prefs.vault_id.clone(), prefs);
 }
@@ -216,12 +220,120 @@ pub fn set_notification_preferences(
 pub fn get_notification_preferences(
     notif_store: &NotificationStore,
     vault_id: &str,
-) -> Option<crate::models::NotificationPreferences> {
+) -> Option<crate::models::VaultNotificationPreferences> {
+
     notif_store.lock().unwrap().get(vault_id).cloned()
+}
+
+use rusqlite::{params, Connection};
+
+/// SQLite-backed DB used by the axum reminder-preferences API.
+///
+/// This is the contract expected by `backend/src/main.rs`, `routes.rs`,
+/// `scheduler.rs`, and `tests.rs`.
+pub struct Db {
+    conn: std::sync::Mutex<Connection>,
+}
+
+
+
+impl Db {
+    pub fn open(path: &str) -> Result<Self, rusqlite::Error> {
+let conn = Connection::open(path)?;
+        Ok(Self { conn: std::sync::Mutex::new(conn) })
+
+    }
+
+    pub fn migrate(&self) -> Result<(), rusqlite::Error> {
+self.conn.lock().unwrap().execute_batch(
+
+            r#"
+            CREATE TABLE IF NOT EXISTS reminder_preferences (
+                vault_id              INTEGER PRIMARY KEY,
+                channels             TEXT NOT NULL,
+                hours_before_expiry  INTEGER NOT NULL,
+                frequency            TEXT NOT NULL
+            );
+            "#,
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert(&self, prefs: &ReminderPreferences) -> Result<(), rusqlite::Error> {
+        let channels_json = serde_json::to_string(&prefs.channels).unwrap();
+self.conn.lock().unwrap().execute(
+
+            r#"
+            INSERT INTO reminder_preferences (vault_id, channels, hours_before_expiry, frequency)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(vault_id) DO UPDATE SET
+              channels = excluded.channels,
+              hours_before_expiry = excluded.hours_before_expiry,
+              frequency = excluded.frequency
+            "#,
+            params![
+                prefs.vault_id as i64,
+                channels_json,
+                prefs.hours_before_expiry as i64,
+                serde_json::to_string(&prefs.frequency).unwrap(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get(&self, vault_id: u64) -> Result<ReminderPreferences, rusqlite::Error> {
+let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            "SELECT vault_id, channels, hours_before_expiry, frequency FROM reminder_preferences WHERE vault_id = ?1",
+
+
+        )?;
+        let row = stmt.query_row(params![vault_id as i64], |r| {
+            let channels_str: String = r.get(1)?;
+            let frequency_str: String = r.get(3)?;
+            let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
+            let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
+            Ok(ReminderPreferences {
+                vault_id: r.get::<_, i64>(0)? as u64,
+                channels,
+                hours_before_expiry: r.get::<_, i64>(2)? as u32,
+                frequency,
+            })
+        })?;
+        Ok(row)
+    }
+
+    pub fn all(&self) -> Result<Vec<ReminderPreferences>, rusqlite::Error> {
+let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+        "SELECT vault_id, channels, hours_before_expiry, frequency FROM reminder_preferences",
+
+
+        )?;
+        let iter = stmt.query_map([], |r| {
+            let channels_str: String = r.get(1)?;
+            let frequency_str: String = r.get(3)?;
+            let channels: Vec<Channel> = serde_json::from_str(&channels_str).unwrap_or_default();
+            let frequency: Frequency = serde_json::from_str(&frequency_str).unwrap();
+            Ok(ReminderPreferences {
+                vault_id: r.get::<_, i64>(0)? as u64,
+                channels,
+                hours_before_expiry: r.get::<_, i64>(2)? as u32,
+                frequency,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for item in iter {
+            out.push(item?);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]

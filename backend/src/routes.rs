@@ -38,6 +38,9 @@ pub async fn get_preferences(
     State(db): State<Arc<Db>>,
     Path(vault_id): Path<u64>,
 ) -> Result<Json<ReminderPreferences>, AppError> {
-    let prefs = db.get(vault_id)?;
-    Ok(Json(prefs))
+    match db.get(vault_id) {
+        Ok(prefs) => Ok(Json(prefs)),
+        Err(_e) => Err(AppError::NotFound),
+    }
 }
+
