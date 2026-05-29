@@ -159,6 +159,25 @@ pub const ARBITRATION_RULED_TOPIC: Symbol = symbol_short!("arb_rul");
 // Issue #497: Beneficiary Notification
 pub const VAULT_NOTIFY_TOPIC: Symbol = symbol_short!("v_notif");
 
+// Issue #577: Withdrawal Confirmation
+pub const WITHDRAWAL_CONFIRMATION_REQUESTED_TOPIC: Symbol = symbol_short!("wd_conf_req");
+pub const WITHDRAWAL_CONFIRMATION_CONFIRMED_TOPIC: Symbol = symbol_short!("wd_conf_ok");
+pub const WITHDRAWAL_CONFIRMATION_EXPIRED_TOPIC: Symbol = symbol_short!("wd_conf_exp");
+
+// Issue #578: Withdrawal Delegation
+pub const WITHDRAWAL_DELEGATE_ADDED_TOPIC: Symbol = symbol_short!("wd_del_add");
+pub const WITHDRAWAL_DELEGATE_REMOVED_TOPIC: Symbol = symbol_short!("wd_del_rem");
+pub const WITHDRAWAL_BY_DELEGATE_TOPIC: Symbol = symbol_short!("wd_by_del");
+
+// Issue #579: Multi-Token Vault Support
+pub const TOKEN_ADDED_TOPIC: Symbol = symbol_short!("tok_add");
+pub const TOKEN_REMOVED_TOPIC: Symbol = symbol_short!("tok_rem");
+pub const TOKEN_BALANCE_UPDATED_TOPIC: Symbol = symbol_short!("tok_bal");
+
+// Issue #580: Token Swap on Release
+pub const TOKEN_SWAP_CONFIGURED_TOPIC: Symbol = symbol_short!("swap_cfg");
+pub const TOKEN_SWAP_EXECUTED_TOPIC: Symbol = symbol_short!("swap_exec");
+
 pub const BENEFICIARY_TRIGGER_SET_TOPIC: Symbol = symbol_short!("ben_trg");
 pub const BENEFICIARY_TIER_SET_TOPIC: Symbol = symbol_short!("ben_tier");
 pub const BENEFICIARY_WATERFALL_TOPIC: Symbol = symbol_short!("ben_wfl");
@@ -254,6 +273,16 @@ pub enum DataKey {
     TtlBorrow(u64),
     // Issue #553: encrypted backup codes
     EncryptedBackupCodes(u64),
+    // Issue #577: Withdrawal Confirmation
+    WithdrawalConfirmation(u64),
+    // Issue #578: Withdrawal Delegation
+    WithdrawalDelegates(u64),
+    // Issue #579: Multi-Token Vault Support
+    VaultTokenBalances(u64),
+    // Issue #580: Token Swap on Release
+    TokenSwapConfig(u64),
+    // Countdown notification fired bitmask
+    CountdownFired(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -801,4 +830,45 @@ pub struct BeneficiaryRotationEntry {
 pub struct CountdownConfig {
     /// Sorted descending list of thresholds in seconds (e.g. [604800, 259200, 86400]).
     pub thresholds: Vec<u64>,
+}
+
+// Issue #577: Withdrawal Confirmation
+/// Pending withdrawal confirmation request
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalConfirmation {
+    pub vault_id: u64,
+    pub amount: i128,
+    pub requested_at: u64,
+    pub confirmation_deadline: u64,
+    pub confirmed: bool,
+}
+
+// Issue #578: Withdrawal Delegation
+/// Withdrawal delegate entry
+#[contracttype]
+#[derive(Clone)]
+pub struct WithdrawalDelegate {
+    pub delegate: Address,
+    pub added_at: u64,
+    pub max_amount: Option<i128>,
+}
+
+// Issue #579: Multi-Token Vault Support
+/// Token balance entry for multi-token vaults
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenBalance {
+    pub token_address: Address,
+    pub balance: i128,
+}
+
+// Issue #580: Token Swap on Release
+/// Token swap configuration for release
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenSwapConfig {
+    pub from_token: Address,
+    pub to_token: Address,
+    pub min_output_amount: i128,
 }

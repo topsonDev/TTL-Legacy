@@ -18,6 +18,7 @@ use types::{
     GeoCheckInEntry,
     ProofOfLifeEntry, ReleaseVoteEntry,
     BeneficiaryRotationEntry,
+    WithdrawalConfirmation, WithdrawalDelegate, TokenBalance, TokenSwapConfig,
     EXPIRY_WARNING_THRESHOLD, BENEFICIARY_UPDATED_TOPIC, BENEFICIARY_TRIGGER_SET_TOPIC, BENEFICIARY_TIER_SET_TOPIC,
     BENEFICIARY_WATERFALL_TOPIC, BENEFICIARY_REBALANCED_TOPIC, CANCEL_TOPIC, CHECK_IN_TOPIC,
     BeneficiaryCommitment,
@@ -52,6 +53,10 @@ use types::{
     CHECKIN_RATE_LIMITED_TOPIC, TTL_ACCELERATE_TOPIC, CHECKIN_GEO_TOPIC,
     EncryptedBackupCodes, PasskeyAnalytics, PasskeyUsageStat,
     BACKUP_CODES_ENCRYPTED_TOPIC, PASSKEY_ANALYTICS_TOPIC,
+    WITHDRAWAL_CONFIRMATION_REQUESTED_TOPIC, WITHDRAWAL_CONFIRMATION_CONFIRMED_TOPIC, WITHDRAWAL_CONFIRMATION_EXPIRED_TOPIC,
+    WITHDRAWAL_DELEGATE_ADDED_TOPIC, WITHDRAWAL_DELEGATE_REMOVED_TOPIC, WITHDRAWAL_BY_DELEGATE_TOPIC,
+    TOKEN_ADDED_TOPIC, TOKEN_REMOVED_TOPIC, TOKEN_BALANCE_UPDATED_TOPIC,
+    TOKEN_SWAP_CONFIGURED_TOPIC, TOKEN_SWAP_EXECUTED_TOPIC,
 };
 #[cfg(test)]
 mod regression_tests;
@@ -7955,5 +7960,447 @@ impl TtlVaultContract {
         }
 
         ttl
+    }
+
+    // --- Issue #577: Withdrawal Confirmation ---
+
+    /// Request confirmation for a large withdrawal
+    pub fn request_withdrawal_confirmation(
+        env: Env,
+        vault_id: u64,
+        amount: i128,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+        if vault.balance < amount {
+            return Err(ContractError::InsufficientBalance);
+        }
+
+        let now = env.ledger().timestamp();
+        let confirmation_deadline = now + 86_400; // 24 hours
+
+        let confirmation = WithdrawalConfirmation {
+            vault_id,
+            amount,
+            requested_at: now,
+            confirmation_deadline,
+            confirmed: false,
+        };
+
+        let key = DataKey::WithdrawalConfirmation(vault_id);
+        env.storage().persistent().set(&key, &confirmation);
+        let ttl_ledgers = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl_ledgers);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (WITHDRAWAL_CONFIRMATION_REQUESTED_TOPIC, vault_id),
+            (amount, confirmation_deadline),
+        );
+        Ok(())
+    }
+
+    /// Confirm a pending withdrawal
+    pub fn confirm_withdrawal(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let key = DataKey::WithdrawalConfirmation(vault_id);
+        let mut confirmation: WithdrawalConfirmation = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::NoScheduledWithdrawals)?;
+
+        let now = env.ledger().timestamp();
+        if now > confirmation.confirmation_deadline {
+            return Err(ContractError::OwnershipTransferExpired);
+        }
+
+        confirmation.confirmed = true;
+        env.storage().persistent().set(&key, &confirmation);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (WITHDRAWAL_CONFIRMATION_CONFIRMED_TOPIC, vault_id),
+            confirmation.amount,
+        );
+        Ok(())
+    }
+
+    /// Execute a confirmed withdrawal
+    pub fn execute_confirmed_withdrawal(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let key = DataKey::WithdrawalConfirmation(vault_id);
+        let confirmation: WithdrawalConfirmation = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::NoScheduledWithdrawals)?;
+
+        if !confirmation.confirmed {
+            return Err(ContractError::WithdrawalNotApproved);
+        }
+
+        let now = env.ledger().timestamp();
+        if now > confirmation.confirmation_deadline {
+            env.storage().persistent().remove(&key);
+            return Err(ContractError::OwnershipTransferExpired);
+        }
+
+        let amount = confirmation.amount;
+        if vault.balance < amount {
+            return Err(ContractError::InsufficientBalance);
+        }
+
+        let token_client = token::Client::new(&env, &vault.token_address);
+        token_client.transfer(&env.current_contract_address(), &vault.owner, &amount);
+        vault.balance -= amount;
+        Self::save_vault(&env, vault_id, &vault);
+
+        env.storage().persistent().remove(&key);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish((WITHDRAW_TOPIC, vault_id), (amount, vault.balance));
+        Ok(())
+    }
+
+    // --- Issue #578: Withdrawal Delegation ---
+
+    /// Add a withdrawal delegate
+    pub fn add_withdrawal_delegate(
+        env: Env,
+        vault_id: u64,
+        delegate: Address,
+        max_amount: Option<i128>,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let delegate_entry = WithdrawalDelegate {
+            delegate: delegate.clone(),
+            added_at: env.ledger().timestamp(),
+            max_amount,
+        };
+
+        let key = DataKey::WithdrawalDelegates(vault_id);
+        let mut delegates: Vec<WithdrawalDelegate> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        delegates.push_back(delegate_entry);
+        env.storage().persistent().set(&key, &delegates);
+        let ttl_ledgers = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl_ledgers);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (WITHDRAWAL_DELEGATE_ADDED_TOPIC, vault_id),
+            (delegate, max_amount.unwrap_or(0)),
+        );
+        Ok(())
+    }
+
+    /// Remove a withdrawal delegate
+    pub fn remove_withdrawal_delegate(
+        env: Env,
+        vault_id: u64,
+        delegate: Address,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let key = DataKey::WithdrawalDelegates(vault_id);
+        let mut delegates: Vec<WithdrawalDelegate> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::NotBeneficiary)?;
+
+        let mut found = false;
+        let mut new_delegates = Vec::new(&env);
+        for d in delegates.iter() {
+            if d.delegate != delegate {
+                new_delegates.push_back(d.clone());
+            } else {
+                found = true;
+            }
+        }
+
+        if !found {
+            return Err(ContractError::NotBeneficiary);
+        }
+
+        if new_delegates.is_empty() {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &new_delegates);
+        }
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish((WITHDRAWAL_DELEGATE_REMOVED_TOPIC, vault_id), delegate);
+        Ok(())
+    }
+
+    /// Withdraw as a delegate
+    pub fn withdraw_as_delegate(
+        env: Env,
+        vault_id: u64,
+        amount: i128,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let mut vault = Self::load_vault(&env, vault_id);
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        if vault.balance < amount {
+            return Err(ContractError::InsufficientBalance);
+        }
+
+        let key = DataKey::WithdrawalDelegates(vault_id);
+        let delegates: Vec<WithdrawalDelegate> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::NotBeneficiary)?;
+
+        let mut found = false;
+        for d in delegates.iter() {
+            if d.delegate == caller {
+                if let Some(max) = d.max_amount {
+                    if amount > max {
+                        return Err(ContractError::WithdrawalNotApproved);
+                    }
+                }
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            return Err(ContractError::NotBeneficiary);
+        }
+
+        let token_client = token::Client::new(&env, &vault.token_address);
+        token_client.transfer(&env.current_contract_address(), &caller, &amount);
+        vault.balance -= amount;
+        Self::save_vault(&env, vault_id, &vault);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (WITHDRAWAL_BY_DELEGATE_TOPIC, vault_id),
+            (caller, amount, vault.balance),
+        );
+        Ok(())
+    }
+
+    // --- Issue #579: Multi-Token Vault Support ---
+
+    /// Add a token to the vault
+    pub fn add_token_to_vault(
+        env: Env,
+        vault_id: u64,
+        token_address: Address,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let key = DataKey::VaultTokenBalances(vault_id);
+        let mut balances: Vec<TokenBalance> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Check if token already exists
+        for b in balances.iter() {
+            if b.token_address == token_address {
+                return Err(ContractError::InvalidBeneficiary);
+            }
+        }
+
+        balances.push_back(TokenBalance {
+            token_address: token_address.clone(),
+            balance: 0,
+        });
+
+        env.storage().persistent().set(&key, &balances);
+        let ttl_ledgers = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl_ledgers);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish((TOKEN_ADDED_TOPIC, vault_id), token_address);
+        Ok(())
+    }
+
+    /// Get token balances for a vault
+    pub fn get_token_balances(env: Env, vault_id: u64) -> Vec<TokenBalance> {
+        let key = DataKey::VaultTokenBalances(vault_id);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Deposit to a specific token in the vault
+    pub fn deposit_token(
+        env: Env,
+        vault_id: u64,
+        token_address: Address,
+        amount: i128,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let key = DataKey::VaultTokenBalances(vault_id);
+        let mut balances: Vec<TokenBalance> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::VaultNotFound)?;
+
+        let mut found = false;
+        for b in balances.iter_mut() {
+            if b.token_address == token_address {
+                b.balance = b.balance.checked_add(amount).ok_or(ContractError::BalanceOverflow)?;
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            return Err(ContractError::InvalidBeneficiary);
+        }
+
+        let token_client = token::Client::new(&env, &token_address);
+        token_client.transfer(&caller, &env.current_contract_address(), &amount);
+
+        env.storage().persistent().set(&key, &balances);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (TOKEN_BALANCE_UPDATED_TOPIC, vault_id),
+            (token_address, amount),
+        );
+        Ok(())
+    }
+
+    // --- Issue #580: Token Swap on Release ---
+
+    /// Configure token swap for release
+    pub fn set_token_swap_config(
+        env: Env,
+        vault_id: u64,
+        from_token: Address,
+        to_token: Address,
+        min_output_amount: i128,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let swap_config = TokenSwapConfig {
+            from_token,
+            to_token,
+            min_output_amount,
+        };
+
+        let key = DataKey::TokenSwapConfig(vault_id);
+        env.storage().persistent().set(&key, &swap_config);
+        let ttl_ledgers = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl_ledgers);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (TOKEN_SWAP_CONFIGURED_TOPIC, vault_id),
+            (from_token, to_token, min_output_amount),
+        );
+        Ok(())
+    }
+
+    /// Get token swap configuration
+    pub fn get_token_swap_config(env: Env, vault_id: u64) -> Option<TokenSwapConfig> {
+        let key = DataKey::TokenSwapConfig(vault_id);
+        env.storage().persistent().get(&key)
     }
 }
