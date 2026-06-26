@@ -25,6 +25,7 @@ pub const PAUSE_TOPIC: Symbol = symbol_short!("pause");
 pub const UNPAUSE_TOPIC: Symbol = symbol_short!("unpause");
 pub const SET_VESTING_TOPIC: Symbol = symbol_short!("set_vest");
 pub const CLAIM_VEST_TOPIC: Symbol = symbol_short!("clm_vest");
+pub const VESTING_CANCELLED_TOPIC: Symbol = symbol_short!("vest_can");
 // Issue #534: vesting cliff period reached
 pub const CLIFF_REACHED_TOPIC: Symbol = symbol_short!("clif_rch");
 pub const PAUSE_VAULT_TOPIC: Symbol = symbol_short!("v_pause");
@@ -56,6 +57,7 @@ pub const BENEFICIARY_IDENTITY_ORACLE_SET_TOPIC: Symbol = symbol_short!("ben_id_
 pub const BENEFICIARY_IDENTITY_VERIFIED_TOPIC: Symbol = symbol_short!("ben_id_vf");
 pub const BENEFICIARY_CONFLICT_FILED_TOPIC: Symbol = symbol_short!("ben_conf");
 pub const BENEFICIARY_CONFLICT_RESOLVED_TOPIC: Symbol = symbol_short!("ben_res");
+pub const CONFLICT_EXPIRED_TOPIC: Symbol = symbol_short!("conf_exp");
 pub const SET_RECOVERY_TOPIC: Symbol = symbol_short!("set_rec");
 pub const RECOVERY_EXTEND_TOPIC: Symbol = symbol_short!("rec_ext");
 pub const RESTORE_VAULT_TOPIC: Symbol = symbol_short!("restore");
@@ -72,6 +74,8 @@ pub const MULTISIG_PROPOSED_TOPIC: Symbol = symbol_short!("ms_prop");
 pub const MULTISIG_APPROVED_TOPIC: Symbol = symbol_short!("ms_app");
 pub const MULTISIG_REJECTED_TOPIC: Symbol = symbol_short!("ms_rej");
 pub const MULTISIG_EXECUTED_TOPIC: Symbol = symbol_short!("ms_exec");
+pub const MULTISIG_VETOED_TOPIC: Symbol = symbol_short!("ms_veto");
+pub const MULTISIG_SIGNER_REMOVED_TOPIC: Symbol = symbol_short!("ms_rm_sig");
 pub const MULTISIG_PROPOSAL_EXPIRY: u64 = 604_800; // 7 days
 
 pub const META_VERSION_TOPIC: Symbol = symbol_short!("meta_ver");
@@ -424,6 +428,8 @@ pub enum DataKey {
     BeneficiaryAuction(u64),
     BeneficiaryAuctionBid(u64, Address),
     BeneficiaryAuctionCount,
+    // Issue #796: open proposals tracking
+    OpenProposals(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -994,6 +1000,7 @@ pub enum ProposalStatus {
     Rejected,
     Executed,
     Expired,
+    Vetoed,
 }
 
 /// State transition record for vault status changes - Issue #472
