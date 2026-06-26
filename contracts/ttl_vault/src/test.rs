@@ -453,6 +453,15 @@ fn test_initiate_ownership_transfer_stores_pending_request() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #82)")]
+fn test_initiate_ownership_transfer_to_current_owner_fails() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    // new_owner == current owner — should fail with AlreadyOwner (#82)
+    client.initiate_ownership_transfer(&vault_id, &owner, &owner);
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #36)")]
 fn test_accept_ownership_transfer_before_timelock_fails() {
     let (env, owner, beneficiary, _, _, client) = setup();
@@ -578,6 +587,32 @@ fn test_cancel_ownership_transfer_emits_cancelled_event() {
 }
 
 #[test]
+fn test_new_owner_can_decline_ownership_transfer() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let new_owner = Address::generate(&env);
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    client.initiate_ownership_transfer(&vault_id, &owner, &new_owner);
+    client.cancel_ownership_transfer(&vault_id, &new_owner);
+
+    assert!(client.get_pending_ownership_transfer(&vault_id).is_none());
+    assert_eq!(client.get_vault(&vault_id).owner, owner);
+    assert!(find_event_by_topic(&env, types::OWNERSHIP_CANCELLED_TOPIC));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_unrelated_address_cannot_cancel_ownership_transfer() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let new_owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    client.initiate_ownership_transfer(&vault_id, &owner, &new_owner);
+    client.cancel_ownership_transfer(&vault_id, &stranger);
+}
+
+#[test]
 fn test_accept_ownership_transfer_emits_accepted_event() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let new_owner = Address::generate(&env);
@@ -587,6 +622,33 @@ fn test_accept_ownership_transfer_emits_accepted_event() {
     env.ledger().with_mut(|l| l.timestamp += 86_401);
     client.accept_ownership_transfer(&vault_id, &new_owner);
     assert!(find_event_by_topic(&env, types::OWNERSHIP_ACCEPTED_TOPIC));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_expire_ownership_transfer_before_expiry_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let new_owner = Address::generate(&env);
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    client.initiate_ownership_transfer(&vault_id, &owner, &new_owner);
+    // Not yet expired — should fail with NotExpired (#16)
+    client.expire_ownership_transfer(&vault_id);
+}
+
+#[test]
+fn test_expire_ownership_transfer_after_expiry_succeeds() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let new_owner = Address::generate(&env);
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    client.initiate_ownership_transfer(&vault_id, &owner, &new_owner);
+    // Advance past OWNERSHIP_TRANSFER_EXPIRY (604_800 seconds)
+    env.ledger().with_mut(|l| l.timestamp += 604_801);
+    client.expire_ownership_transfer(&vault_id);
+
+    assert!(client.get_pending_ownership_transfer(&vault_id).is_none());
+    assert!(find_event_by_topic(&env, types::OWNERSHIP_TRANSFER_EXPIRED_TOPIC));
 }
 
 #[test]
@@ -2418,6 +2480,36 @@ fn test_set_vesting_schedule_rejects_empty_vault() {
         .unwrap_err()
         .unwrap();
     assert_eq!(err, ContractError::EmptyVault);
+}
+
+#[test]
+fn test_get_vesting_schedule_count_zero() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    assert_eq!(client.get_vesting_schedule_count(&vault_id), 0u32);
+}
+
+#[test]
+fn test_get_vesting_schedule_count_one() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &1_000i128);
+    let start = env.ledger().timestamp() + 50;
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &0u64);
+    assert_eq!(client.get_vesting_schedule_count(&vault_id), 1u32);
+}
+
+#[test]
+fn test_get_vesting_schedule_count_max() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    // MAX_VESTING_SCHEDULES = 20; deposit enough for 20 schedules of 1 each
+    client.deposit(&vault_id, &owner, &20i128);
+    let start = env.ledger().timestamp() + 50;
+    for _ in 0..20u32 {
+        client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &1u32, &0u64);
+    }
+    assert_eq!(client.get_vesting_schedule_count(&vault_id), 20u32);
 }
 
 #[test]

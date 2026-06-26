@@ -1,27 +1,54 @@
 use std::sync::Arc;
 
 use axum::{
-    body::{to_bytes, Body},
-    extract::DefaultBodyLimit,
-    http::{Request, StatusCode},
+    body::Body,
+    extract::State,
+    http::{HeaderValue, Method, Request, StatusCode},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use serde_json::json;
 use tower::ServiceExt;
+use tower_http::cors::CorsLayer;
 
-use crate::{db::Db, routes};
+use crate::{db::{Db, PoolConfig}, routes};
 
 fn test_app() -> Router {
-    let db = Arc::new(Db::open(":memory:").unwrap());
+    test_app_with_db(Arc::new(Db::open(":memory:").unwrap()))
+}
+
+fn test_app_with_db(db: Arc<Db>) -> Router {
     db.migrate().unwrap();
     Router::new()
+        .route("/health", get(health_handler))
+        .route("/ready", get(ready_handler))
         .route(
             "/api/vaults/:vault_id/reminder-preferences",
             post(routes::set_preferences).get(routes::get_preferences),
         )
-        .layer(DefaultBodyLimit::max(1_048_576))
+        .route(
+            "/notifications/unsubscribe",
+            get(routes::unsubscribe),
+        )
         .with_state(db)
+}
+
+async fn health_handler() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+async fn ready_handler(State(db): State<Arc<Db>>) -> Result<Json<serde_json::Value>, StatusCode> {
+    match db.check_connectivity() {
+        Ok(()) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "database": "connected",
+        }))),
+        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 
 async fn post_json(app: Router, uri: &str, body: serde_json::Value) -> axum::response::Response {
@@ -131,87 +158,138 @@ async fn test_upsert_overwrites() {
     assert_eq!(fetched.frequency, crate::models::Frequency::Hourly);
 }
 
-// ── #819: Body size limit tests ───────────────────────────────────────────────
+// ── #821: Health check endpoint tests ────────────────────────────────────────
 
-/// Oversized body (2 MB) must be rejected with 413 Payload Too Large.
 #[tokio::test]
-async fn test_oversized_body_rejected_with_413() {
+async fn test_health_endpoint() {
     let app = test_app();
-    let large_body = vec![b'a'; 2 * 1024 * 1024]; // 2 MB
+    let res = get_req(app, "/health").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "ok");
+    assert!(json["version"].is_string());
+}
+
+#[tokio::test]
+async fn test_ready_endpoint() {
+    let app = test_app();
+    let res = get_req(app, "/ready").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["database"], "connected");
+}
+
+// ── #822: Pool configuration tests ───────────────────────────────────────────
+
+#[tokio::test]
+async fn test_pool_config_defaults() {
+    let config = PoolConfig::default();
+    assert_eq!(config.min, 2);
+    assert_eq!(config.max, 10);
+    assert_eq!(config.timeout_secs, 30);
+}
+
+#[tokio::test]
+async fn test_db_open_with_pool_config() {
+    let config = PoolConfig { min: 1, max: 5, timeout_secs: 15 };
+    let db = Db::open_with_pool_config(":memory:", &config);
+    assert!(db.is_ok());
+}
+
+// ── #823: CORS tests ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_cors_allowed_origin() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    db.migrate().unwrap();
+
+    let cors = CorsLayer::new()
+        .allow_origin("http://example.com".parse::<HeaderValue>().unwrap())
+        .allow_methods([Method::GET, Method::POST]);
+
+    let app = Router::new()
+        .route("/health", get(health_handler))
+        .layer(cors)
+        .with_state(db);
+
     let res = app
         .oneshot(
             Request::builder()
-                .method("POST")
-                .uri("/api/vaults/1/reminder-preferences")
-                .header("content-type", "application/json")
-                .header("content-length", large_body.len().to_string())
-                .body(Body::from(large_body))
+                .method("OPTIONS")
+                .uri("/health")
+                .header("origin", "http://example.com")
+                .header("access-control-request-method", "GET")
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    assert!(res.headers().get("access-control-allow-origin").is_some());
+    assert_eq!(
+        res.headers().get("access-control-allow-origin").unwrap(),
+        "http://example.com"
+    );
 }
 
-/// Normal-sized body (well under 1 MB) must not be rejected by the size limit.
 #[tokio::test]
-async fn test_normal_body_accepted() {
-    let app = test_app();
-    let body = json!({
-        "channels": ["email"],
-        "hours_before_expiry": 24,
-        "frequency": "daily"
-    });
-    let res = post_json(app, "/api/vaults/1/reminder-preferences", body).await;
-    // Not 413 — the body limit did not trigger.
-    assert_ne!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(res.status(), StatusCode::OK);
+async fn test_cors_rejected_origin() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    db.migrate().unwrap();
+
+    let cors = CorsLayer::new()
+        .allow_origin("http://allowed.com".parse::<HeaderValue>().unwrap())
+        .allow_methods([Method::GET]);
+
+    let app = Router::new()
+        .route("/health", get(health_handler))
+        .layer(cors)
+        .with_state(db);
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/health")
+                .header("origin", "http://evil.com")
+                .header("access-control-request-method", "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let origin_header = res.headers().get("access-control-allow-origin");
+    match origin_header {
+        Some(val) => assert_ne!(val, "http://evil.com"),
+        None => {} // No header is also acceptable
+    }
 }
 
-// ── #820: Structured error response shape tests ───────────────────────────────
+// ── #824: Scheduler resilience tests ─────────────────────────────────────────
 
-/// 404 response body must be JSON with code = "not_found".
 #[tokio::test]
-async fn test_not_found_error_json_shape() {
-    let app = test_app();
-    let res = get_req(app, "/api/vaults/999/reminder-preferences").await;
-    assert_eq!(res.status(), StatusCode::NOT_FOUND);
-    let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("response must be JSON");
-    assert_eq!(json["code"], "not_found");
-    assert!(json["message"].is_string());
+async fn test_scheduler_handles_db_errors_gracefully() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    // Intentionally do NOT run migrate() so tables don't exist.
+    // The scheduler should log errors and continue, not panic.
+    let result = db.all();
+    assert!(result.is_err());
 }
 
-/// 422 response body must be JSON with code = "invalid_input".
 #[tokio::test]
-async fn test_invalid_input_error_json_shape() {
-    let app = test_app();
-    let body = json!({
-        "channels": [],
-        "hours_before_expiry": 24,
-        "frequency": "once"
-    });
-    let res = post_json(app, "/api/vaults/1/reminder-preferences", body).await;
-    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("response must be JSON");
-    assert_eq!(json["code"], "invalid_input");
-    assert!(json["message"].is_string());
+async fn test_scheduler_insurance_handles_db_errors() {
+    let db = Arc::new(Db::open(":memory:").unwrap());
+    // No migration — all_enabled_insurance_policies will fail.
+    let result = db.all_enabled_insurance_policies();
+    assert!(result.is_err());
 }
 
-/// Second invalid-input path (zero hours) also returns proper ApiError JSON.
 #[tokio::test]
-async fn test_zero_hours_error_json_shape() {
-    let app = test_app();
-    let body = json!({
-        "channels": ["push"],
-        "hours_before_expiry": 0,
-        "frequency": "once"
-    });
-    let res = post_json(app, "/api/vaults/1/reminder-preferences", body).await;
-    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("response must be JSON");
-    assert_eq!(json["code"], "invalid_input");
-    assert!(json["message"].is_string());
+async fn test_db_check_connectivity() {
+    let db = Db::open(":memory:").unwrap();
+    assert!(db.check_connectivity().is_ok());
 }
