@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, post},
     Router,
 };
@@ -17,6 +18,7 @@ mod tests;
 
 pub use db::Db;
 
+const MAX_BODY_BYTES: usize = 1_048_576; // 1 MB
 
 #[tokio::main]
 async fn main() {
@@ -37,6 +39,7 @@ async fn main() {
             "/api/vaults/:vault_id/reminder-preferences",
             post(routes::set_preferences).get(routes::get_preferences),
         )
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(db);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
